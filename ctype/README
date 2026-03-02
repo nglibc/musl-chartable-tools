@@ -1,0 +1,63 @@
+gen_wcdata and gen_casemap tools
+================================
+
+Use gen_wcdata to generate the header files for new versions of
+iswalpha.c, iswpunct.c and wcwidth.c. (Done automatically by make).
+
+No changes made to gen_casemap, which is needed for casemap.h
+
+The new iswalpha, iswpunct and wcwidth functions are half the binary
+size of the old musl functions (as measured by binutils 'size' tool).
+The new encoding also features a speed improvement, with lookups for
+80-90% of code blocks done with just a single memory load.
+
+The remaining Unicode blocks are niche uses, and are accessed with
+three memory loads.  Compared to the old musl encoding (which used a
+two level table) the topmost level remains much the same, providing
+offsets into code block units (256 codepoint granularity). The second
+level data uses fixed sizes, of one 32 bit word per codepage (where
+each 2 bit pair in word identifies a block of 16 codepoints as all 0,
+all 1, or mixed). The third level is a variable length series of 'ext'
+extension bytes, indexed by the popcount of set high bits within the
+second level's 32 bit word. Popcount is used as not all 16 codepoint
+blocks need an extension byte. This popcount is calculated with nearly
+the same latency as a 32 bit multiply (so it is comparable with the
+indexing speed of accessing a 2D array of non power of 2 size), but
+has the advantage of greater compactness for sparse data.  A fourth
+memory access (to load a 16b short indexed by 'ext') is needed on rare
+occasions.
+
+The command line syntax below is accepted. The 'a', 'p', 'w' letters
+generate iswalpha_table.h, iswpunct_table.h and wcwidth_table.h, and
+the upper case letters generate the the _dict.h header files:
+
+    gen_wcdata [-v] a|p|w|A|P|W
+
+Also, if compiled together with the functions source, it will do tests
+of these wctype/wchar functions against this repo's Unicode data.
+If compiled as just the gen_wcdata.c source file alone, the tool tests
+against the compiler's C library equivalent functions.
+
+To test against the compiler C library functions, execute the following
+(where 'a' tests iswalpha, 'p' tests iswpunct, 'v' tests wcwidth):
+
+    gen_wcdata -t|T a|p|v
+
+Although gen_wcdata is a full replacement for gen_ctype, gen_wide and
+gen_nonspacing, these tools are retained for regression testing.
+
+A test recipe has been added to Makefile to generate both new and old
+header files, and compile test_wcdata with new & old source files.
+To run these tests, execute:
+
+    make test
+
+Alternatively, the test_wcdata tool can be run directly using:
+
+    test_wcdata -t|T a|p|v
+
+or (to test older musl functions) using:
+
+    test_wcdata_v0 -t|T a|p|v
+
+
