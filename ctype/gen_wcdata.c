@@ -1,49 +1,67 @@
 #define _XOPEN_SOURCE
 #include <wchar.h>
 #include <wctype.h>
-#include <endian.h>
+#include <assert.h>
+#include <locale.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-#define PAGE_SH   8
-#define PAGE_MAX  (1u << PAGE_SH)
-#define PAGES     (0x20000 / PAGE_MAX)
-#define PAGEH     (PAGES + 0x1000/8)
 #define DICTM     235   /* store Ns-W full combos @ [DICTM+1,255) */
+#define PAGE_MAX  256
+#define PAGEH     (0x20000 / 64)
+#define HASH_SH   (7+6)
 
 /* Header max PAGEH bytes and dictionary max 256, but both may be smaller */
-static unsigned char  head[PAGEH];
 static unsigned short dict[256];
-static unsigned words [PAGES][PAGE_MAX/16 + 1];
-static unsigned wordnr[PAGES];
+static unsigned char  table[PAGEH];
+static unsigned char  head[PAGEH];
+static unsigned words [PAGEH][PAGE_MAX + 1];
+static unsigned wordnr[PAGEH];
 static int dictnr = 0, dictmk = DICTM, directwc = 0;
 static int vflag, tflag, Tflag;
 
-static void read_data(unsigned wanted, char set[0x110000])
+static void read_data(unsigned wanted, int set[0x110000])
 {
-	char buf[128], dummy;
-	unsigned a, b;
 	FILE *f0, *f1, *f2;
+	unsigned a, b, u, l;
+	int *ltab = calloc(0x110000, sizeof *ltab), c;
+	int *utab = calloc(0x110000, sizeof *utab);
+	char buf[256], dummy, *fmt, *p;
 
 	f0 = fopen("data/UnicodeData.txt", "rb");
 	f1 = fopen("data/DerivedCoreProperties.txt", "rb");
 	f2 = fopen("data/EastAsianWidth.txt", "rb");
-	if (!set || !f0 || !f1 || !f2 || wanted<1) {
-		printf("error: no Unicode data files or invalid set\n");
+	if (!set || !f0 || !f1 || !f2 || !ltab || !utab) {
+		printf("error: no Unicode data files or invalid buffers\n");
 		goto exit;
 	}
 
-	/* Number (decimal) & punctuation: */
-	if (wanted < 3) while (fgets(buf, sizeof buf, f0)) {
-		if (sscanf(buf, "%x;%*[^;];Nd%c", &a, &dummy)==2)
-			set[a] = 1;
-		else if (sscanf(buf, "%x;%*[^;];%c", &a, &dummy)==2)
-			set[a] = 2;
+	/* Nonspacing: flag = 2 (maps to type = 1), Number: 1, Punctuation: 2 */
+	for (c = 0, p = buf; c != EOF; p = buf) {
+		char us[16] = "", ls[16] = "", cat[16] = " ";
+
+		while ((c = fgetc(f0)) != '\n' && c > 0 && p-buf < sizeof buf-3)
+			p += sprintf(p, c == ';' ? " %c":"%c", c);
+
+		fmt = "%x ;%*[^;];%15[^ ;] ;%*[^;];%*[^;];%*[^;];%*[^;];"
+		      "%*[^;];%*[^;];%*[^;];%*[^;];%*[^;];%15[^;];%15[^;]";
+		sscanf(buf, fmt, &a, cat, us, ls);
+		if (*cat > ' ' && strstr("Me Mn Cf ", cat))
+			set[a] = (wanted <= 2) * 2;
+		else
+			set[a] = (wanted <= 1) * (strcmp(cat, "Nd") ? 2:1);
+
+		u = strtoul(us, 0, 16);
+		l = strtoul(ls, 0, 16);
+		if ((a | l | u) < 0x110000) {
+			ltab[a] = l ? l-a : 0;
+			utab[a] = u ? u-a : 0;
+		}
 	}
 
 	/* Alphabetic: */
-	if (wanted < 3) while (fgets(buf, sizeof buf, f1)) {
+	if (wanted <= 1) while (fgets(buf, sizeof buf, f1)) {
 		if (sscanf(buf, "%x..%x ; Alphabetic%c", &a, &b, &dummy)==3)
 			for (; a<=b; a++) set[a]=1;
 		else if (sscanf(buf, "%x ; Alphabetic%c", &a, &dummy)==2)
@@ -51,169 +69,99 @@ static void read_data(unsigned wanted, char set[0x110000])
 	}
 
 	/* Wide: flag = 1 (maps to type = ~ns*2|wide^ns = 3) */
-	if (wanted >= 3) while (fgets(buf, sizeof buf, f2)) {
+	if (wanted == 2) while (fgets(buf, sizeof buf, f2)) {
 		if (sscanf(buf, "%x..%x;%*[WF]%c", &a, &b, &dummy)==3)
-			for (; a<=b; a++) set[a] = 1;
+			for (; a<=b; a++) set[a] |= !set[a];
 		else if (sscanf(buf, "%x;%*[WF]%c", &a, &dummy)==2)
-			set[a] = 1;
+			set[a] |= !set[a];
 	}
-
-	/* Nonspacing: flag = 2 (maps to type = ~ns*2|wide^ns = 1) */
-	if (wanted >= 3) while (fgets(buf, sizeof buf, f0)) {
-		if (sscanf(buf, "%x;%*[^;];M%*[en]%c", &a, &dummy)==2)
-			set[a] = 2;
-		else if (sscanf(buf, "%x;%*[^;];Cf%c", &a, &dummy)==2)
-			set[a] = 2;
-	}
-
-	/* Control chars: flag = 3 (maps to type = ~ns*2|wide^ns = 0) */
-	for (a=0x00; a<=0x1f; a++) set[a]=3*(wanted==4);
-	for (a=0x7f; a<=0x9f; a++) set[a]=3*(wanted==4);
-	for (a=0xfffe; a<=0xffff; a++) set[a]=3, set[a|0x10000]=3;
 
 	/* Misc fixes */
-	if (wanted < 3) {
-		/* Fix misclassified Thai characters */
-		set[0xe2f] = set[0xe46] = 2;
-
-		/* Clear digits */
-		for (a=0x30; a<=0x39; a++) set[a]=0;
-
-		/* Clear spaces */
-		set[0x0020] = 0;
-		for (a=0x2000; a<=0x2006; a++) set[a]=0;
-		for (a=0x2008; a<=0x200a; a++) set[a]=0;
-		set[0x205f] = 0;
-		set[0x3000] = 0;
-
-		/* Clear additional controls */
-		for (a=0x2028; a<=0x2029; a++) set[a]=0;
-		for (a=0xfff9; a<=0xfffb; a++) set[a]=0;
-		for (a=0xd800; a<=0xdfff; a++) set[a]=0;
-
-		/* Fill in elided CJK ranges */
-		for (a =0x3400; a<=0x4db5; a++) set[a]=1;
-		for (a =0x4e00; a<=0x9fcc; a++) set[a]=1;
-		for (a =0xac00; a<=0xd7a3; a++) set[a]=1;
-		for (a =0x20000; a<=0x2a6d6; a++) set[a]=1;
-		for (a =0x2a700; a<=0x2b734; a++) set[a]=1;
-		for (a =0x2b740; a<=0x2b81d; a++) set[a]=1;
-
-		for (a=0; a<=0x10ffff; a++)
-			set[a] = (set[a] == wanted);
+	if (wanted <= 2) {
+		#include "init_ctype.h"
 	} else {
-		/* Nonspacing: Hangul vowel/trailing, NULL, 0xad */
-		for (a=0x1160; a<=0x11ff; a++) set[a] = 2;
-		for (a=0xd7b0; a<=0xd7ff; a++) set[a] = 2;
-		set[0]=2*(wanted==4); set[0xad]=0;
+		#include "init_casemap.h"
 	}
 
 	exit:
 	fclose(f0);
 	fclose(f1);
 	fclose(f2);
+	free(ltab);
+	free(utab);
 	return;
 }
 
-static int encode_data(unsigned wanted, const char set[0x110000])
+static int encode_data(unsigned wanted, const int set[0x110000])
 {
-	unsigned a = sizeof(unsigned);
-	int      p, i, j, d, e, err;
-	memset(head,   0, sizeof head);
-	memset(dict,   0, sizeof dict);
-	memset(words,  0, sizeof words);
-	memset(wordnr, 0, sizeof wordnr);
+	unsigned a = 4;  /* word alignment */
+	unsigned n = wanted <= 2 ? 256:64, last = 0x20000 / n;
+	unsigned p, i, j, r, d, e, err, base;
 
-	for (p=0, err=0; p < PAGES; p++) {
-		unsigned wc = p * PAGE_MAX;
-		char  *exts = (char *)words[p] + a;
+	for (p = 0, err = 0, base = 0; p < last; p++) {
+		unsigned char buf[PAGE_MAX] = {0}, rules[4] = {0};
+		unsigned char *exts  = (unsigned char *)words[p] + a;
+		unsigned odd = p & 1, wc = p * n;
+		unsigned left = 0, right = 1;
+		head[p] = 255;
 
 		/* Some code pages where direct bitmap encoding is better */
 		if (wc < directwc) {
-			for (i = 0; i < PAGE_MAX; i++) {
-				unsigned val = set[wc + i] == 1;
-				head[PAGES + (wc+i)/8] |= val << ((wc+i) & 7);
+			for (i = 0; i < n; i++) {
+				unsigned val = (set[wc + i] & 0xff) == 1;
+				head[last + (wc+i)/8] |= val << ((wc+i) & 7);
 			}
 			continue;
 		}
 
-		/* Skip all-one or all-zero pages */
-		head[p] = 255;
-		for (i = 0; i < PAGE_MAX && set[wc+i] == set[wc]; i++);
-		if (i == PAGE_MAX && set[wc] <= 1) {
-			head[p] = set[wc];
+		/* Skip all-zero/all-one pages, except any NULL first page */
+		for (i = 0, r = 0; i < n; r += buf[i++] == buf[0])
+			buf[i] = set[wc + i] & 0xff;
+		if (p >= (wanted >= 3) && r == n && buf[0] <= 1) {
+			head[p] = buf[0] & 1;
 			continue;
 		}
 
-		/* Mixed block: split page into 16 cp sets, create dict & exts entries */
+		/* Sub-block runs: left (len>=4 & merged) overwrite right (len<4) */
+		if (wanted >= 3) for (i = 0, r = 1; i < n; i = r) {
+			unsigned rule = buf[i], z, brk;
+			for (r = i+1; r < n && buf[r] == rule; r++);
+			for (j = r+0; j < n && buf[j] == 0; j++);
+
+			if (rule-1 < 55 && (r-i >= 4 || j == n)) {
+				if (rule == 8*2+1)    /* Alternating +8/-8 runs */
+					for (z = i; z < r && i%16 == 8; rule = --buf[z++]);
+				brk = rules[left > 1] != rule || j == n;
+
+				if (brk && left <= 1 || !left) {
+					exts[left*2 + !left] = i;
+					exts[left*2 +  left] = r;
+					rules[left++] = rule;
+				} else if (rules[left-1] == rule) {
+					i = exts[left*3-3], exts[left*3-3] = r;
+				}
+			} else if (rule-1 < 55 && right >= left) {
+				exts[right*2 + !right] = i;
+				exts[right*2 +  right] = r;
+				rules[right] = rule, right -= !!right;
+			}
+		}
+
+		/* Mixed block: encoding is specific to wanted set */
 		if (vflag)
-			printf("\npage U+%05x: ", wc);
-		for (i = 0, e = 0; i<PAGE_MAX/16; i++) {
-			unsigned word = 0, wide = 0, ns = 0;
-			unsigned quad = 8, ext = 0, shfl = i*2 % (a*8);
-
-			for (j = 0; j < 16; j++) {
-				ns   |= set[wc + i*16 + j]/2 << j; /* Ns 0=>type 2, 2=>type0/1 */
-				wide |= set[wc + i*16 + j]%2 << j; /* wctype attr/Asian width  */
-			}
-
-			word = ns << 16 | wide;  /* if all set[wc] <= 1, then word=wide */
-			if (wanted < 3) {
-				unsigned pat_lo = wanted == 1 ? 255:0, pat_hi = word & 0xff80;
-
-				if (word == 0x0000 || word == 0xffff) {
-					words[p][i/(4*a)] |= (word&1) << shfl;
-					continue;
-				}
-
-				if (word <= 0x3fff || word >= 0xc000) {
-					if (pat_hi == 0 || pat_hi == 0xff80)  /* Store lower 8b */
-						quad = 2, ext = word & 0xff;
-					else if ((word & 0xff) == pat_lo)     /* Store upper 7b */
-						quad = pat_lo & 1, ext = word>>7 & 0xfe;
-				}
-
-				if (!err && quad == 8) {
-					for (j = 0; j < dictnr && dict[j] != word; j++);
-					if (j == dictnr)
-						j < 128 ? (dict[dictnr++] = word) : (err = 2);
-					quad = ~pat_lo & 1, ext = j << 1, dictmk = dictnr;
-				}
-			} else {
-				unsigned type = (~ns & 1)*2 | (wide^ns) & 1;
-
-				if (word == 0 || word == 0xffff || word == 0xffff0000) {
-					words[p][i/(4*a)] |= (type^3) << shfl;  /* Store type xor 3 */
-					continue;
-				}
-
-				for (j = wide ? DICTM:-1; !err; ) {
-					if (ns && ++j>=dictmk && (!wide || ++j>254))  /* Ns_W: j+=2 */
-						err |= 2;
-					if (!dict[j] || dict[j]==(wide ? wide:~ns & 0xffff))
-						break;
-					if (!ns && --j<dictmk && dict[dictmk=j])
-						err |= 2;
-				}
-
-				if (!err && !dict[ext = j]) {
-					err |= (~ns & 0xffff) == 0;  /* zero vals are illegal in dict */
-					if (ns)   dict[j--] = ~ns;   /* idx Ns>=0 (stored as inverse) */
-					if (wide) dict[j--] = wide;  /* idx Wide<=DICTM, Ns_W>DICTM   */
-				}
-			}
-			words[p][i/(4*a)] |= (quad >= 2 ? 3:2) << shfl;
-			exts[e++] = ext | quad & 1;
-
-			if (vflag && (!ns || !wide))
-				printf("0%c%04x [%02x] ", 'x' - !!ns*32, ns | wide, ext);
-			else if (vflag)
-				printf("0x%08x [%02x] ", ns<<16 | wide, ext);
+			printf("page U+%05x: [0x%02x-%02x=%2x,%02x-%02x=%2x]",
+			       wc, exts[1], exts[0], rules[0], exts[2], exts[3], rules[1]);
+		if (wanted <= 2) {
+			#include "enc_ctype.h"
+		} else {
+			#include "enc_casemap.h"
 		}
 		wordnr[p] = e;
+		if (vflag)
+			printf(e > 0 ? "\n\0  <%d>%s\n":"%.*s\n", base += e+4, "");
 	}
 
-	if (!err && wanted >= 3) {
+	if (!err && wanted == 2) {
 		/* Compact dict: close gap btw lo & hi vals, set dictnr=num lo+hi+combos */
 		for (e = dictmk, d = e-1; d >= 0 && !dict[d]; d--);
 		memmove(dict+(++d), dict+e, sizeof dict - e*sizeof dict[0]);
@@ -223,72 +171,86 @@ static int encode_data(unsigned wanted, const char set[0x110000])
 	return err;
 }
 
-static int export_table(int quiet)
+static int export_table(int wanted, int header_only)
 {
-	unsigned a = sizeof(unsigned);
-	unsigned start = directwc/PAGE_MAX;
-	unsigned tabnr = 2*a;    /* Base 0-1 reserved */
-	int      p, q, i, j;
-	char     buf[PAGES * (40 + 20 + 4*PAGE_MAX/16)], *bp = buf;
+	unsigned a = wanted <= 2 ? 4:8;
+	unsigned n = wanted <= 2 ? 256:64;
+	unsigned start = directwc/n, last = 0x20000/n;
+	unsigned tabnr = wanted <= 2 ? 2*a:0;    /* Reserve base 0-1 */
+	char     buf[PAGEH * (40 + 20 + 4*n/16)], *bp = buf;
+	int      p, q, i, j, *map;
 
-	for (p = start, q = 0; p < PAGES || q >= 0; p += 2) {
+	for (p = start, q = 0; p < last || q > 0; p += 2) {
 		int threshold = 0, pad = 0, dictgap = dictmk - dictnr;
-		int l = p < PAGES ? wordnr[p]:0, m = 0;
-		if (p < PAGES && head[p] != 255)
+		int l = p < last ? wordnr[p]:0, m = 0, r = 0;
+		if (p < last && head[p] != 255)
 			continue;
 
 		/* Match even page p with odd page q so that padding is minimised */
-		for (q = start+1; q < PAGES; q += 2) {
-			pad = (a-1) - (l + (m = wordnr[q]) + a-1) % a;
+		for (q = start+1; q < last; q += 2) {
+			pad = (a-1) - (l + (m = wordnr[q]) + (a-4)*(p>=last) + a-1) % a;
 			if (head[q] == 255 && pad <= threshold)
 				break;
-			if (q+2 > PAGES)
+			if (q+2 > last)
 				threshold++, q = start-1;
 			if (threshold > a) {
-				pad = (a-1) - (l + (m = 0) + a-1) % a;
+				pad = (a-1) - (l + (m = 0) + (a-4) + a-1) % a;
 				q = -1;
 				break;
 			}
 		}
-		if (tabnr+3*a+l+m >= 256*a || bp+(l+m)*4+120-buf > sizeof buf) {
-			printf("error: data too big or resize buffer to fit data\n");
+		if (tabnr+8+a+l+m >= 256*a || bp+(l+m)*4+120-buf > sizeof buf) {
+			printf("error: data (%d,%d) too big\n", tabnr+l+m, (int)(bp-buf)+(l+m)*4);
 			return 1;
 		}
 
 		/* Write table data for even page, then alignment padding */
-		if (p < PAGES || q >= 0)
-			bp += sprintf(bp, "\n\n/* wctype: U+%05x,%05x idx [%d-%d) */\n",
-			              p*PAGE_MAX*(p<PAGES), q*PAGE_MAX*(q>=0),
-			              tabnr/a-2, tabnr/a-2+(l+m+pad)/a+(q>=0)+(p<PAGES));
-		if (p < PAGES) {
+		if (p < last || q > 0)
+			bp += sprintf(bp, "\n\n/* wcdata: U+%05x,%05x idx [%d-%d) */\n",
+			              p * n * (p<last), q * n * (q>0),
+			              tabnr/a, tabnr/a+(l+m+pad+4*(q>0)+4*(p<last))/a);
+		if (p < last) {
 			bp += sprintf(bp, "BYTES(0x%08x),", words[p][0]);
 			head[p] = tabnr/a;
-			tabnr += a;
+			tabnr += 4;
 			for (j = 0; j < l; j++, tabnr++) {
-				unsigned char *v = (unsigned char *)words[p] + a + j;
-				bp += sprintf(bp, "%d,", *v>=dictnr ? *v-dictgap:*v);
+				unsigned char val = ((unsigned char *)words[p])[4 + j];
+				if (val >= dictnr) val -= dictgap;
+				bp += sprintf(bp, "%d%s", val, r++%16==15 ? ",\n":",");
 			}
 		}
 		for (i = 0; i < pad; i++, tabnr++)
 			bp += sprintf(bp, "0,");
 
 		/* Write table data for odd page */
-		if (q >= 0) {
+		if (q > 0) {
 			for (j = m-1; j >= 0; j--, tabnr++) {
-				unsigned char *v = (unsigned char *)words[q] + a + j;
-				bp += sprintf(bp, "%d,", *v>=dictnr ? *v-dictgap:*v);
+				unsigned char val = ((unsigned char *)words[q])[4 + j];
+				if (val >= dictnr) val -= dictgap;
+				bp += sprintf(bp, "%d%s", val, r++%16==15 ? ",\n":",");
 			}
 			bp += sprintf(bp, "BYTES(0x%08x),", words[q][0]);
 			head[q] = tabnr/a;
-			tabnr += a;
+			tabnr += 4;
 		}
 	}
 
-	printf("/* wctype: pages %d x %d, bmap 0x%x */\n", PAGES, PAGE_MAX, directwc);
-	for (p = 0; p < PAGES + directwc/8; p++)
-		printf("%3d%s", head[p], p%16 == 15 ? ",\n":",");
-	if (!quiet)
-		printf("%s\n", buf);
+	map = wanted<=2 ? (int[]) {0, 512, 0, 512}
+	                : (int[]) {0, 136, 0, 136, 136, 884, 0, 128, 1020, 1028, 128, 128};
+	for (i = 0; i < last + directwc/8; map += 4) {
+		for (i = map[0]; i < (map[1] + directwc/8) + map[0]; i++) {
+			j = map[2] + i % (map[3] + directwc/8);
+			if (table[j] && head[i])
+				return printf("error: hash collision at %d+%d\n", map[0], map[1]), 1;
+			table[j] += head[i];
+		}
+	}
+
+	printf("/* wcdata: pages %d x %d, bmap 0x%x */\n", last, n, directwc);
+	for (p = 0; p <= j; p++) {
+		printf("%3d%s", table[p], p % 16 == 15 ? ",\n":",");
+	}
+	printf("%s\n", header_only ? "":buf);
 	return 0;
 }
 
@@ -298,7 +260,7 @@ static int export_dict()
 	while (dict[max] && ++max < sizeof dict/sizeof dict[0]);
 
 	/* Print lo vals [0-LO_END), hi vals [LO_END-HI_END) & combo vals beyond */
-	printf("/* wctype: dictionary %d entries*/\n", max);
+	printf("/* wcdata: dictionary %d entries*/\n", max);
 	printf("#define LO_END %d\n", dictnr);
 	printf("#define HI_END %d\n", DICTM + 1 - (dictmk - dictnr));
 
@@ -307,66 +269,64 @@ static int export_dict()
 	return printf("\n"), 0;
 }
 
-static void verify_data(int wanted, const char set[0x110000], unsigned wc)
+static void verify_data(int wanted, const int set[0x110000], unsigned wc)
 {
 	unsigned log, fails, tests;
 	char wcmap[] = {3, 2, 0, 1};
 
 	for (log = fails = tests = 0; wc < 0x20000; wc++, tests++) {
-		int exp = set[wc];
-		int got = wanted == 1 ? !!iswalpha(wc)
-	            : wanted == 2 ? !!iswpunct(wc) : wcmap[wcwidth(wc)+1];
+		int exp = set[wc] >> 12;
+		int got = wanted >= 4 ? towupper(wc)
+				: wanted == 3 ? towlower(wc)
+				: wanted == 2 ? wcmap[wcwidth(wc)+1]
+				: wanted == 1 ? !!iswpunct(wc) : !!iswalpha(wc);
+
 		if (exp != got)
 			log += !log, fails++;
 
 		if (log && log++ <= 20) {
-			unsigned direct, page, lane;
-			unsigned target;
-			char *msg = (exp == got) ? "PASS":"FAIL";
+			char *msg = (exp == got) ? "PASS":"FAIL", direct = wc < directwc;
 
-			direct = wc < directwc;
-			target = wc & (PAGE_MAX-1);
-			page = !direct ? (wc >> PAGE_SH) : (wc>>3) + PAGES;
-			lane = (target >> 4);
-			printf("/* %s U+%05X: exp %d got %d page %03x %c(%02x) "
-			       "target 0x%03x lane %d */\n", 
-				   msg, wc, exp, got, page, 'b'+!direct, head[page], target, lane);
+			printf("/* %s U+%05X: exp %d got %d index %c */\n", 
+			       msg, wc, exp, got, 'b'+!direct);
 		}
 	}
-	printf("/* wctype: %u codepoints verified, %u errors */\n", tests, fails);
+	printf("/* wcdata: %u codepoints verified, %u errors */\n", tests, fails);
 }
 
 int main(int argc, char *argv[])
 {
-	char *cmds = "apwv", *set = calloc(0x110000,1);
+	const char *help = "usage: %s [-v][-t][-T] a|A|p|P|w|W|l|L|u|U|c|C\n"; 
+	const char *cmds = "apwluc";
 	char *cmd, *arg0;
+	int  *set = calloc(0x110000, sizeof *set), wanted;
 
-	for (arg0 = *argv++; *argv && **argv == '-'; argv++) {
-		if (strcmp(*argv, "-v") == 0)       /* Verbose output */
-			vflag = 1;
-		else if (strcmp(*argv, "-t") == 0)  /* Test output */
+	setlocale(LC_CTYPE, "");
+	for (arg0 = *argv++; *argv && **argv == '-' && (*argv)++; argv++) {
+		if ((**argv | 32) == 'v')  /* Verbose output */
+			vflag = **argv;
+		else if (**argv == 't')  /* Test output */
 			tflag = 1;
-		else if (strcmp(*argv, "-T") == 0)  /* Test with header output */
+		else if (**argv == 'T')  /* Test with header output */
 			Tflag = 1;
 		else break;
 	}
 
-	cmd = strchr(cmds, **argv | 32);
-	if (cmd) {
-		int wanted = cmd - cmds + 1;
-		read_data(wanted, set);
+	cmd = *argv ? strchr(cmds, **argv | 32) : NULL;
+	if (cmd && set) {
+		read_data(wanted = cmd - cmds, set);
 
 		/* Encode data for export or test header log output */
-		if (wanted < 3)
-			directwc = wanted == 1 ? 0x1000:0x800;
+		if (wanted <= 1)
+			directwc = wanted ? 0x800:0x1000;
 		if (!tflag && !encode_data(wanted, set))
-			**argv >= 'a' ? export_table(Tflag):export_dict();
+			**argv >= 'a' ? export_table(wanted, Tflag):export_dict();
 
 		/* Verify starting at codepoint given by arg or 0x0 */
 		if (tflag || Tflag)
 			verify_data(wanted, set, *++argv ? strtoul(*argv, NULL, 0):0);
 	} else {
-		fprintf(stderr, "usage: %s [-v][-t][-T] a|A|p|P|w|W|v|W\n", arg0);
+		fprintf(stderr, set ? help:"error:%s:mem alloc failed", arg0);
 	}
 	free(set);
 	return 0;

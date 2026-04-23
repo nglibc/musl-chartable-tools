@@ -1,18 +1,17 @@
-gen_wcdata and gen_casemap tools
+gen_wcdata and test_wcdata tools
 ================================
 
 Use gen_wcdata to generate the header files for new versions of
-iswalpha.c, iswpunct.c and wcwidth.c. (Done automatically by make).
+iswalpha.c, iswpunct.c, wcwidth.c and towctrans.c. (The 'make all'
+recipe will do this automatically).
 
-No changes made to gen_casemap, which is needed for casemap.h
-
-The new iswalpha, iswpunct and wcwidth functions are half the binary
-size of the old musl functions (as measured by binutils 'size' tool).
-The new encoding also features a speed improvement, with lookups for
-80-90% of code blocks done with just a single memory load.
+The new functions are half the binary size of the old musl functions
+(as measured by binutils 'size' tool). The new encoding also features
+a speed improvement, with lookups for 80-90% of code blocks done with
+fewer memory loads than existing functions.
 
 The remaining Unicode blocks are niche uses, and are accessed with
-three memory loads.  Compared to the old musl encoding (which used a
+1-2 more memory loads. Compared to the old musl encoding (which used
 two level table) the topmost level remains much the same, providing
 offsets into code block units (256 codepoint granularity). The second
 level data uses fixed sizes, of one 32 bit word per codepage (where
@@ -23,15 +22,14 @@ second level's 32 bit word. Popcount is used as not all 16 codepoint
 blocks need an extension byte. This popcount is calculated with nearly
 the same latency as a 32 bit multiply (so it is comparable with the
 indexing speed of accessing a 2D array of non power of 2 size), but
-has the advantage of greater compactness for sparse data.  A fourth
-memory access (to load a 16b short indexed by 'ext') is needed on rare
-occasions.
+has the advantage of greater compactness for sparse data.
 
 The command line syntax below is accepted. The 'a', 'p', 'w' letters
 generate iswalpha_table.h, iswpunct_table.h and wcwidth_table.h, and
-the upper case letters generate the the _dict.h header files:
+the upper case letters generate the the _dict.h header files. The 'c'
+and 'C' letters generates the corresponding files for towctrans.
 
-    gen_wcdata [-v] a|p|w|A|P|W
+    gen_wcdata [-v] a|p|w|c|A|P|W|C
 
 Also, if compiled together with the functions source, it will do tests
 of these wctype/wchar functions against this repo's Unicode data.
@@ -39,12 +37,14 @@ If compiled as just the gen_wcdata.c source file alone, the tool tests
 against the compiler's C library equivalent functions.
 
 To test against the compiler C library functions, execute the following
-(where 'a' tests iswalpha, 'p' tests iswpunct, 'v' tests wcwidth):
+(where 'a' tests iswalpha, 'p' tests iswpunct, 'w' tests wcwidth and
+'l'/'u' test towctrans lower & upper case):
 
-    gen_wcdata -t|T a|p|v
+    gen_wcdata -t|-T a|p|w|l|u
 
-Although gen_wcdata is a full replacement for gen_ctype, gen_wide and
-gen_nonspacing, these tools are retained for regression testing.
+Although gen_wcdata is a full replacement for gen_ctype, gen_wide,
+gen_nonspacing and gen_casemap, these tools are retained for regression
+testing, and hence are moved into a 'deprecated' sub-directory.
 
 A test recipe has been added to Makefile to generate both new and old
 header files, and compile test_wcdata with new & old source files.
@@ -54,10 +54,10 @@ To run these tests, execute:
 
 Alternatively, the test_wcdata tool can be run directly using:
 
-    test_wcdata -t|T a|p|v
+    test_wcdata -t|-T a|p|w|l|u
 
 or (to test older musl functions) using:
 
-    test_wcdata_v0 -t|T a|p|v
+    test_wcdata_deprec -t|-T a|p|w|l|u
 
 

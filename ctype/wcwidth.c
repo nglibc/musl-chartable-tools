@@ -1,8 +1,8 @@
 #include <wchar.h>
 #include <endian.h>
 
-#define BYTE(x,y) ((x) >> (y^(__BYTE_ORDER == __BIG_ENDIAN ? 0:24)) & 255)
-#define BYTES(x)  BYTE(x,24),BYTE(x,16),BYTE(x,8),BYTE(x,0)
+#define BYTE(x,y) ((x) >> (y^(__BYTE_ORDER == __LITTLE_ENDIAN ? 0:24)) & 255)
+#define BYTES(x)  BYTE(x,0),BYTE(x,8),BYTE(x,16),BYTE(x,24)
 #define PAGE_SH   8
 #define PAGE_MAX  (1u << PAGE_SH)
 #define PAGEH     (0x20000 / PAGE_MAX)
@@ -18,7 +18,7 @@ const static unsigned short dict[216] = {
 #include "wcwidth_dict.h"
 };
 
-int wcwidth_lookup(wchar_t wc)
+static int wcwidth_lookup(wchar_t wc)
 {
 	unsigned page, shfr, base, lane, rev, target;
 	unsigned huff, type, popc, val;
@@ -28,7 +28,7 @@ int wcwidth_lookup(wchar_t wc)
 	page = (wc >> PAGE_SH);
 	base = table.b[page];
 	if (base < 2)
-		return base + 1 - (((wc+1 & ~0x80) < 0x21) << !!wc);
+		return base + 1;
 
 	/* 2nd & 3rd level arrays: final level idx=popc^rev_direction */
 	target = wc & (PAGE_MAX-1);
@@ -55,6 +55,8 @@ int wcwidth_lookup(wchar_t wc)
 
 int wcwidth(wchar_t wc)
 {
+	if (wc < 0xffU)
+		return (wc+1 & 0x7f) >= 0x21 ? 1 : wc ? -1 : 0;
 	if (wc < 0x20000)
 		return wcwidth_lookup(wc);
 	if (wc-0x20000U < 0x20000)
